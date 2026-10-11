@@ -1,0 +1,1382 @@
+--==========================================================================
+--  심플 에임 + ESP + 에임 락 + 트리거봇 (PC 전용 - Nova UI)
+--==========================================================================
+if getgenv().SimpleAimESP_Unload then
+    pcall(getgenv().SimpleAimESP_Unload)
+end
+if not game:IsLoaded() then game.Loaded:Wait() end
+
+local Players           = game:GetService("Players")
+local RunService        = game:GetService("RunService")
+local UserInputService  = game:GetService("UserInputService")
+local TweenService      = game:GetService("TweenService")
+local Workspace         = game:GetService("Workspace")
+local Camera            = Workspace.CurrentCamera
+local LocalPlayer       = Players.LocalPlayer
+
+--==========================================================================
+--  설정값
+--==========================================================================
+local Config = {
+    AimbotEnabled   = false,
+    AimbotKey       = Enum.KeyCode.E,
+    AimbotFOV       = 150,
+    AimbotSmoothing = 0.25,
+    AimbotTeamCheck = true,
+    ShowFOV         = true,
+
+    AimLockEnabled   = false,
+    AimLockTarget    = nil,
+    AimLockSmoothing = 0.00,
+    AimLockBreakDist = 500,
+
+    TriggerbotEnabled   = false,
+    TriggerbotKey       = Enum.KeyCode.T,
+    TriggerbotHold      = true,
+    TriggerbotDelay     = 0.05,
+    TriggerbotTeamCheck = true,
+    TriggerbotFOV       = 5,
+
+    ESPEnabled      = false,
+    ESPEnemies      = true,
+    ESPTeammates    = false,
+    ESPBox          = true,
+    ESPName         = true,
+    ESPHealth       = true,
+    ESPDistance     = true,
+    ESPEnemyColor   = Color3.fromRGB(255, 60, 60),
+    ESPTeamColor    = Color3.fromRGB(60, 200, 255),
+    ESPLockColor    = Color3.fromRGB(255, 200, 40),
+}
+
+--==========================================================================
+--  팀 판별
+--==========================================================================
+local function getTeamId(player)
+    local ok, id = pcall(function() return player:GetAttribute("TeamID") end)
+    if ok and id ~= nil then return id end
+    if player.Team then return player.Team end
+    return nil
+end
+
+local function isEnemy(player)
+    if player == LocalPlayer then return false end
+    local myTeam = getTeamId(LocalPlayer)
+    local theirTeam = getTeamId(player)
+    if myTeam == nil or theirTeam == nil then return true end
+    return myTeam ~= theirTeam
+end
+
+local function isAlive(player)
+    local char = player.Character
+    if not char then return false end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    local head = char:FindFirstChild("Head")
+    return hum ~= nil and hum.Health > 0 and head ~= nil
+end
+
+--==========================================================================
+--  타겟
+--==========================================================================
+local function getClosestTarget()
+    local screenCenter = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
+    local closest, closestDist = nil, Config.AimbotFOV
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer then
+            if not (Config.AimbotTeamCheck and not isEnemy(player)) then
+                local char = player.Character
+                if char then
+                    local head = char:FindFirstChild("Head")
+                    local humanoid = char:FindFirstChildOfClass("Humanoid")
+                    if head and humanoid and humanoid.Health > 0 then
+                        local screenPos, onScreen = Camera:WorldToViewportPoint(head.Position)
+                        if onScreen then
+                            local dist = (Vector2.new(screenPos.X, screenPos.Y) - screenCenter).Magnitude
+                            if dist < closestDist then
+                                closestDist = dist
+                                closest = { player = player, part = head }
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return closest
+end
+
+local function updateAimLockTarget()
+    if not Config.AimLockEnabled then Config.AimLockTarget = nil; return end
+    if Config.AimLockTarget then
+        local tgt = Config.AimLockTarget
+        if not tgt.Parent or not isAlive(tgt) then
+            Config.AimLockTarget = nil
+        else
+            local head = tgt.Character and tgt.Character:FindFirstChild("Head")
+            if head then
+                local myChar = LocalPlayer.Character
+                local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
+                if myRoot and (head.Position - myRoot.Position).Magnitude > Config.AimLockBreakDist then
+                    Config.AimLockTarget = nil
+                end
+            end
+        end
+    end
+    if not Config.AimLockTarget then
+        local best = getClosestTarget()
+        if best then Config.AimLockTarget = best.player end
+    end
+end
+
+local function getAimTarget()
+    if Config.AimLockTarget then
+        local tgt = Config.AimLockTarget
+        if isAlive(tgt) then
+            local head = tgt.Character and tgt.Character:FindFirstChild("Head")
+            if head then return { player = tgt, part = head } end
+        end
+    end
+    return getClosestTarget()
+end
+
+--==========================================================================
+--  대상 자동 해제
+--==========================================================================
+local function watchTarget(player)
+    if player.Character then
+        local hum = player.Character:FindFirstChildOfClass("Humanoid")
+        if hum then
+            hum.Died:Once(function()
+                if Config.AimLockTarget == player then Config.AimLockTarget = nil end
+            end)
+        end
+    end
+    player.CharacterAdded:Connect(function()
+        if Config.AimLockTarget == player then Config.AimLockTarget = nil end
+    end)
+end
+
+for _, p in ipairs(Players:GetPlayers()) do
+    if p ~= LocalPlayer then
+        if p.Character then watchTarget(p) end
+        p.CharacterAdded:Connect(function() watchTarget(p) end)
+    end
+end
+Players.PlayerAdded:Connect(function(p)
+    if p ~= LocalPlayer then
+        if p.Character then watchTarget(p) end
+        p.CharacterAdded:Connect(function() watchTarget(p) end)
+    end
+end)
+Players.PlayerRemoving:Connect(function(p)
+    if Config.AimLockTarget == p then Config.AimLockTarget = nil end
+end)
+
+--==========================================================================
+--  카메라 락
+--==========================================================================
+local CAMERA_BIND_NAME = "SimpleAimESP_CameraLock"
+pcall(function() RunService:UnbindFromRenderStep(CAMERA_BIND_NAME) end)
+
+local function applyCameraLock()
+    updateAimLockTarget()
+    local holdActive = Config.AimbotEnabled and UserInputService:IsKeyDown(Config.AimbotKey)
+    local lockActive = Config.AimLockEnabled and Config.AimLockTarget ~= nil
+
+    if not (holdActive or lockActive) then
+        if Camera.CameraType == Enum.CameraType.Scriptable then
+            Camera.CameraType = Enum.CameraType.Custom
+        end
+        return
+    end
+    local target = getAimTarget()
+    if not target then
+        if Camera.CameraType == Enum.CameraType.Scriptable then
+            Camera.CameraType = Enum.CameraType.Custom
+        end
+        return
+    end
+    if holdActive and not lockActive then
+        local screenCenter = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
+        local screenPos, onScreen = Camera:WorldToViewportPoint(target.part.Position)
+        if not onScreen then return end
+        local dist = (Vector2.new(screenPos.X, screenPos.Y) - screenCenter).Magnitude
+        if dist > Config.AimbotFOV then return end
+    end
+    if Camera.CameraType ~= Enum.CameraType.Scriptable then
+        Camera.CameraType = Enum.CameraType.Scriptable
+    end
+    local camPos = Camera.CFrame.Position
+    local targetPos = target.part.Position
+    if (targetPos - camPos).Magnitude < 0.1 then return end
+    local lookCFrame = CFrame.lookAt(camPos, targetPos)
+    local smooth = lockActive and Config.AimLockSmoothing or Config.AimbotSmoothing
+    if smooth <= 0 then
+        Camera.CFrame = lookCFrame
+    else
+        Camera.CFrame = Camera.CFrame:Lerp(lookCFrame, 1 - smooth)
+    end
+end
+RunService:BindToRenderStep(CAMERA_BIND_NAME, Enum.RenderPriority.Camera.Value + 100, applyCameraLock)
+
+--==========================================================================
+--  트리거봇
+--==========================================================================
+local triggerState = { lastFire = 0 }
+local function getCrosshairTarget()
+    local screenCenter = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
+    local closest, closestDist = nil, Config.TriggerbotFOV
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer then
+            if not (Config.TriggerbotTeamCheck and not isEnemy(player)) then
+                local char = player.Character
+                if char then
+                    local head = char:FindFirstChild("Head")
+                    local humanoid = char:FindFirstChildOfClass("Humanoid")
+                    if head and humanoid and humanoid.Health > 0 then
+                        local screenPos, onScreen = Camera:WorldToViewportPoint(head.Position)
+                        if onScreen then
+                            local dist = (Vector2.new(screenPos.X, screenPos.Y) - screenCenter).Magnitude
+                            if dist < closestDist then
+                                closestDist = dist
+                                closest = player
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return closest
+end
+
+local function fireWeapon()
+    local VIM = game:GetService("VirtualInputManager")
+    if VIM then
+        pcall(function()
+            VIM:SendMouseButtonEvent(0, 0, 0, true, game, 1)
+            task.wait(0.01)
+            VIM:SendMouseButtonEvent(0, 0, 0, false, game, 1)
+        end)
+        return true
+    end
+    return false
+end
+
+local function updateTriggerbot()
+    if not Config.TriggerbotEnabled then return end
+    if Config.TriggerbotHold then
+        if not UserInputService:IsKeyDown(Config.TriggerbotKey) then return end
+    end
+    local now = tick()
+    if now - triggerState.lastFire < Config.TriggerbotDelay then return end
+    if getCrosshairTarget() then
+        triggerState.lastFire = now
+        fireWeapon()
+    end
+end
+RunService.Heartbeat:Connect(updateTriggerbot)
+
+--==========================================================================
+--  ESP
+--==========================================================================
+local espGui = Instance.new("ScreenGui")
+espGui.Name = "SimpleESP"
+espGui.ResetOnSpawn = false
+espGui.IgnoreGuiInset = true
+espGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+espGui.Parent = (gethui and gethui()) or game:GetService("CoreGui")
+
+local fovGui = Instance.new("ScreenGui")
+fovGui.Name = "SimpleFOV"
+fovGui.ResetOnSpawn = false
+fovGui.IgnoreGuiInset = true
+fovGui.Parent = espGui.Parent
+
+local fovCircle = Instance.new("Frame")
+fovCircle.AnchorPoint = Vector2.new(0.5, 0.5)
+fovCircle.BackgroundTransparency = 1
+fovCircle.Size = UDim2.fromOffset(Config.AimbotFOV * 2, Config.AimbotFOV * 2)
+fovCircle.Position = UDim2.fromScale(0.5, 0.5)
+fovCircle.Visible = Config.ShowFOV
+fovCircle.Parent = fovGui
+
+local fovStroke = Instance.new("UIStroke")
+fovStroke.Color = Color3.fromRGB(255, 255, 255)
+fovStroke.Thickness = 1
+fovStroke.Transparency = 0.4
+fovStroke.Parent = fovCircle
+
+local fovCorner = Instance.new("UICorner")
+fovCorner.CornerRadius = UDim.new(1, 0)
+fovCorner.Parent = fovCircle
+
+local espObjects = {}
+local function createESP(player)
+    local box = Instance.new("Frame")
+    box.BackgroundTransparency = 1
+    box.BorderSizePixel = 0
+    box.Visible = false
+    box.Parent = espGui
+    local boxOutline = Instance.new("UIStroke")
+    boxOutline.Thickness = 1
+    boxOutline.Parent = box
+    local nameTag = Instance.new("TextLabel")
+    nameTag.BackgroundTransparency = 1
+    nameTag.TextScaled = true
+    nameTag.Font = Enum.Font.Code
+    nameTag.TextColor3 = Color3.new(1, 1, 1)
+    nameTag.Position = UDim2.new(0, 0, 0, -16)
+    nameTag.Size = UDim2.new(1, 0, 0, 14)
+    nameTag.Parent = box
+    local healthBar = Instance.new("Frame")
+    healthBar.AnchorPoint = Vector2.new(1, 0)
+    healthBar.Position = UDim2.new(1, -3, 0, 0)
+    healthBar.Size = UDim2.new(0, 3, 1, 0)
+    healthBar.BackgroundColor3 = Color3.fromRGB(0, 255, 0)
+    healthBar.BorderSizePixel = 0
+    healthBar.Parent = box
+    local distTag = Instance.new("TextLabel")
+    distTag.BackgroundTransparency = 1
+    distTag.TextScaled = true
+    distTag.Font = Enum.Font.Code
+    distTag.TextColor3 = Color3.new(1, 1, 1)
+    distTag.Position = UDim2.new(0, 0, 1, 2)
+    distTag.Size = UDim2.new(1, 0, 0, 12)
+    distTag.Parent = box
+    espObjects[player] = { box = box, outline = boxOutline, name = nameTag, health = healthBar, distance = distTag }
+end
+local function removeESP(player)
+    local data = espObjects[player]
+    if not data then return end
+    for _, obj in pairs(data) do
+        if obj and obj.Destroy then obj:Destroy() end
+    end
+    espObjects[player] = nil
+end
+for _, player in ipairs(Players:GetPlayers()) do createESP(player) end
+Players.PlayerAdded:Connect(createESP)
+Players.PlayerRemoving:Connect(removeESP)
+
+local function updateESP()
+    if not Config.ESPEnabled then
+        for _, data in pairs(espObjects) do data.box.Visible = false end
+        return
+    end
+    local myChar = LocalPlayer.Character
+    local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
+    for player, data in pairs(espObjects) do
+        local enemy = isEnemy(player)
+        local shouldShow = enemy and Config.ESPEnemies or (not enemy and Config.ESPTeammates)
+        local char = player.Character
+        local head = char and char:FindFirstChild("Head")
+        local rootPart = char and char:FindFirstChild("HumanoidRootPart")
+        local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+        if shouldShow and char and head and rootPart and humanoid and humanoid.Health > 0 then
+            local topPos, topOnScreen = Camera:WorldToViewportPoint(head.Position + Vector3.new(0, head.Size.Y / 2 + 0.2, 0))
+            local bottomPos, bottomOnScreen = Camera:WorldToViewportPoint(rootPart.Position - Vector3.new(0, 3, 0))
+            if topOnScreen and bottomOnScreen then
+                local height = math.abs(bottomPos.Y - topPos.Y)
+                local width = height / 2
+                local isLocked = (Config.AimLockTarget == player)
+                local color = isLocked and Config.ESPLockColor or (enemy and Config.ESPEnemyColor or Config.ESPTeamColor)
+                data.box.Visible = true
+                data.box.Position = UDim2.fromOffset(topPos.X - width / 2, topPos.Y)
+                data.box.Size = UDim2.fromOffset(width, height)
+                data.outline.Color = color
+                data.name.Visible = Config.ESPName
+                data.name.Text = (isLocked and "[고정] " or "") .. player.Name
+                data.name.TextColor3 = color
+                data.name.Size = UDim2.new(1, 0, 0, math.clamp(height * 0.12, 12, 22))
+                data.name.Position = UDim2.new(0, 0, 0, -data.name.Size.Y.Offset - 2)
+                data.health.Visible = Config.ESPHealth
+                data.health.Size = UDim2.new(0, 3, humanoid.Health / humanoid.MaxHealth, 0)
+                local hpRatio = humanoid.Health / humanoid.MaxHealth
+                data.health.BackgroundColor3 = Color3.fromRGB(255 * (1 - hpRatio), 255 * hpRatio, 0)
+                data.distance.Visible = Config.ESPDistance and myRoot ~= nil
+                if myRoot then
+                    local dist = (rootPart.Position - myRoot.Position).Magnitude
+                    data.distance.Text = string.format("[%dm]", math.floor(dist))
+                    data.distance.TextColor3 = color
+                end
+                data.distance.Position = UDim2.new(0, 0, 1, 2)
+            else
+                data.box.Visible = false
+            end
+        else
+            data.box.Visible = false
+        end
+    end
+end
+RunService.RenderStepped:Connect(updateESP)
+
+--==========================================================================
+--  UI 루트 (드래그 가능한 컨테이너)
+--==========================================================================
+local phoneGui = Instance.new("ScreenGui")
+phoneGui.Name = "NovaUI"
+phoneGui.ResetOnSpawn = false
+phoneGui.IgnoreGuiInset = true
+phoneGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+phoneGui.DisplayOrder = 999
+phoneGui.Parent = espGui.Parent
+
+--  화면 크기
+local function calculatePhoneSize()
+    local vp = Camera.ViewportSize
+    if vp.X <= 0 or vp.Y <= 0 then vp = Vector2.new(1920, 1080) end
+    local targetH = vp.Y * 0.85
+    local targetW = targetH * (9 / 19.5)
+    local maxW = vp.X * 0.35
+    if targetW > maxW then
+        targetW = maxW
+        targetH = targetW * (19.5 / 9)
+    end
+    return math.floor(targetW), math.floor(targetH)
+end
+
+local PHONE_W, PHONE_H = calculatePhoneSize()
+
+--  ★ 전체를 감싸는 래퍼 (드래그로 이동됨)
+local wrapper = Instance.new("Frame")
+wrapper.Name = "Wrapper"
+wrapper.AnchorPoint = Vector2.new(0.5, 0.5)
+wrapper.Position = UDim2.new(0.75, 0, 0.5, 0)  --  오른쪽에 배치 (화면 중앙 안 가림)
+wrapper.Size = UDim2.fromOffset(PHONE_W, PHONE_H)
+wrapper.BackgroundTransparency = 1
+wrapper.Parent = phoneGui
+
+--  스마트폰 본체 (wrapper 안에 꽉 참)
+local phone = Instance.new("Frame")
+phone.Name = "Phone"
+phone.Size = UDim2.fromScale(1, 1)
+phone.BackgroundColor3 = Color3.fromRGB(242, 242, 247)
+phone.BorderSizePixel = 0
+phone.ClipsDescendants = true
+phone.Active = true
+phone.Parent = wrapper
+
+local phoneCorner = Instance.new("UICorner")
+phoneCorner.CornerRadius = UDim.new(0, math.floor(PHONE_W * 0.13))
+phoneCorner.Parent = phone
+
+local phoneStroke = Instance.new("UIStroke")
+phoneStroke.Color = Color3.fromRGB(180, 180, 190)
+phoneStroke.Thickness = 1.5
+phoneStroke.Parent = phone
+
+--  화면 크기 변경 대응
+Camera:GetPropertyChangedSignal("ViewportSize"):Connect(function()
+    local w, h = calculatePhoneSize()
+    wrapper.Size = UDim2.fromOffset(w, h)
+end)
+
+--  ── 상단 드래그 바 ─────────────────────────────────────────
+local dragBar = Instance.new("Frame")
+dragBar.Name = "DragBar"
+dragBar.Size = UDim2.new(1, 0, 0, 36)
+dragBar.BackgroundTransparency = 1
+dragBar.Parent = phone
+
+--  노치 (다이나믹 아일랜드)
+local notch = Instance.new("Frame")
+notch.AnchorPoint = Vector2.new(0.5, 0)
+notch.Position = UDim2.new(0.5, 0, 0, 8)
+notch.Size = UDim2.fromOffset(90, 22)
+notch.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+notch.BorderSizePixel = 0
+notch.ZIndex = 10
+notch.Parent = dragBar
+
+local notchCorner = Instance.new("UICorner")
+notchCorner.CornerRadius = UDim.new(1, 0)
+notchCorner.Parent = notch
+
+--  드래그 힌트 (오른쪽 상단 작게)
+local dragHint = Instance.new("TextLabel")
+dragHint.Text = "⠿"
+dragHint.AnchorPoint = Vector2.new(1, 0.5)
+dragHint.Position = UDim2.new(1, -14, 0, 18)
+dragHint.Size = UDim2.fromOffset(20, 20)
+dragHint.BackgroundTransparency = 1
+dragHint.Font = Enum.Font.GothamBold
+dragHint.TextSize = 14
+dragHint.TextColor3 = Color3.fromRGB(160, 160, 170)
+dragHint.ZIndex = 6
+dragHint.Parent = dragBar
+
+--  ── 컨텐츠 영역 ─────────────────────────────────────────────
+local contentArea = Instance.new("Frame")
+contentArea.Position = UDim2.fromOffset(0, 36)
+contentArea.Size = UDim2.new(1, 0, 1, -36)
+contentArea.BackgroundTransparency = 1
+contentArea.ClipsDescendants = true
+contentArea.Parent = phone
+
+--==========================================================================
+--  홈 화면
+--==========================================================================
+local appsHome = Instance.new("Frame")
+appsHome.Size = UDim2.fromScale(1, 1)
+appsHome.BackgroundTransparency = 1
+appsHome.ZIndex = 1
+appsHome.Parent = contentArea
+
+local homeTitle = Instance.new("TextLabel")
+homeTitle.Text = "앱"
+homeTitle.BackgroundTransparency = 1
+homeTitle.Position = UDim2.fromOffset(24, 8)
+homeTitle.Size = UDim2.new(1, -48, 0, 40)
+homeTitle.Font = Enum.Font.GothamBold
+homeTitle.TextSize = 28
+homeTitle.TextColor3 = Color3.fromRGB(0, 0, 0)
+homeTitle.TextXAlignment = Enum.TextXAlignment.Left
+homeTitle.Parent = appsHome
+
+local appsGrid = Instance.new("Frame")
+appsGrid.Position = UDim2.fromOffset(0, 60)
+appsGrid.Size = UDim2.new(1, 0, 1, -60)
+appsGrid.BackgroundTransparency = 1
+appsGrid.Parent = appsHome
+
+local gridList = Instance.new("UIListLayout")
+gridList.Padding = UDim.new(0, 12)
+gridList.SortOrder = Enum.SortOrder.LayoutOrder
+gridList.HorizontalAlignment = Enum.HorizontalAlignment.Center
+gridList.Parent = appsGrid
+
+--==========================================================================
+--  서브 페이지
+--==========================================================================
+local aimPage = Instance.new("Frame")
+aimPage.Size = UDim2.fromScale(1, 1)
+aimPage.BackgroundColor3 = Color3.fromRGB(242, 242, 247)
+aimPage.BorderSizePixel = 0
+aimPage.Visible = false
+aimPage.ZIndex = 5
+aimPage.Position = UDim2.fromScale(1, 0)
+aimPage.Parent = contentArea
+
+local espPage = Instance.new("Frame")
+espPage.Size = UDim2.fromScale(1, 1)
+espPage.BackgroundColor3 = Color3.fromRGB(242, 242, 247)
+espPage.BorderSizePixel = 0
+espPage.Visible = false
+espPage.ZIndex = 5
+espPage.Position = UDim2.fromScale(1, 0)
+espPage.Parent = contentArea
+
+local function createPageHeader(parent, title, onBack)
+    local header = Instance.new("Frame")
+    header.Size = UDim2.new(1, 0, 0, 96)
+    header.BackgroundTransparency = 1
+    header.ZIndex = 6
+    header.Parent = parent
+
+    local backBtn = Instance.new("TextButton")
+    backBtn.Text = ""
+    backBtn.BackgroundColor3 = Color3.fromRGB(230, 230, 235)
+    backBtn.BorderSizePixel = 0
+    backBtn.Position = UDim2.fromOffset(20, 8)
+    backBtn.Size = UDim2.fromOffset(34, 34)
+    backBtn.AutoButtonColor = false
+    backBtn.ZIndex = 7
+    backBtn.Parent = header
+    local bc = Instance.new("UICorner")
+    bc.CornerRadius = UDim.new(1, 0)
+    bc.Parent = backBtn
+
+    local arrow = Instance.new("TextLabel")
+    arrow.Text = "‹"
+    arrow.BackgroundTransparency = 1
+    arrow.Size = UDim2.fromScale(1, 1)
+    arrow.Font = Enum.Font.GothamBold
+    arrow.TextSize = 26
+    arrow.TextColor3 = Color3.fromRGB(0, 122, 255)
+    arrow.Position = UDim2.fromOffset(0, -4)
+    arrow.ZIndex = 8
+    arrow.Parent = backBtn
+
+    backBtn.MouseButton1Click:Connect(onBack)
+
+    local titleLbl = Instance.new("TextLabel")
+    titleLbl.Text = title
+    titleLbl.BackgroundTransparency = 1
+    titleLbl.Position = UDim2.fromOffset(20, 48)
+    titleLbl.Size = UDim2.new(1, -40, 0, 40)
+    titleLbl.Font = Enum.Font.GothamBold
+    titleLbl.TextSize = 30
+    titleLbl.TextColor3 = Color3.fromRGB(0, 0, 0)
+    titleLbl.TextXAlignment = Enum.TextXAlignment.Left
+    titleLbl.ZIndex = 7
+    titleLbl.Parent = header
+
+    return header
+end
+
+local function createPageBody(parent, topOffset)
+    local scroll = Instance.new("ScrollingFrame")
+    scroll.Position = UDim2.fromOffset(0, topOffset)
+    scroll.Size = UDim2.new(1, 0, 1, -topOffset)
+    scroll.BackgroundTransparency = 1
+    scroll.BorderSizePixel = 0
+    scroll.ScrollBarThickness = 3
+    scroll.ScrollBarImageColor3 = Color3.fromRGB(180, 180, 190)
+    scroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+    scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    scroll.ZIndex = 6
+    scroll.Parent = parent
+
+    local pad = Instance.new("UIPadding")
+    pad.PaddingTop = UDim.new(0, 4)
+    pad.PaddingBottom = UDim.new(0, 30)
+    pad.PaddingLeft = UDim.new(0, 16)
+    pad.PaddingRight = UDim.new(0, 16)
+    pad.Parent = scroll
+
+    local list = Instance.new("UIListLayout")
+    list.Padding = UDim.new(0, 18)
+    list.SortOrder = Enum.SortOrder.LayoutOrder
+    list.Parent = scroll
+
+    return scroll
+end
+
+local function createCard(parent, layoutOrder)
+    local card = Instance.new("Frame")
+    card.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+    card.BorderSizePixel = 0
+    card.Size = UDim2.new(1, 0, 0, 0)
+    card.AutomaticSize = Enum.AutomaticSize.Y
+    card.LayoutOrder = layoutOrder or 0
+    card.ZIndex = 6
+    card.Parent = parent
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, 14)
+    c.Parent = card
+
+    local padding = Instance.new("UIPadding")
+    padding.PaddingTop = UDim.new(0, 2)
+    padding.PaddingBottom = UDim.new(0, 2)
+    padding.Parent = card
+
+    local list = Instance.new("UIListLayout")
+    list.Padding = UDim.new(0, 0)
+    list.SortOrder = Enum.SortOrder.LayoutOrder
+    list.Parent = card
+
+    return card
+end
+
+local function addSettingRow(parent, opts)
+    local rowHeight = opts.subtitle and 62 or 50
+    local row = Instance.new("Frame")
+    row.BackgroundTransparency = 1
+    row.Size = UDim2.new(1, 0, 0, rowHeight)
+    row.ZIndex = 7
+    row.Parent = parent
+
+    local iconBg = Instance.new("Frame")
+    iconBg.AnchorPoint = Vector2.new(0, 0.5)
+    iconBg.Position = UDim2.new(0, 14, 0.5, 0)
+    iconBg.Size = UDim2.fromOffset(30, 30)
+    iconBg.BackgroundColor3 = opts.iconColor
+    iconBg.BorderSizePixel = 0
+    iconBg.ZIndex = 8
+    iconBg.Parent = row
+    local ic = Instance.new("UICorner")
+    ic.CornerRadius = UDim.new(0, 7)
+    ic.Parent = iconBg
+
+    local iconLbl = Instance.new("TextLabel")
+    iconLbl.Text = opts.icon
+    iconLbl.BackgroundTransparency = 1
+    iconLbl.Size = UDim2.fromScale(1, 1)
+    iconLbl.Font = Enum.Font.GothamBold
+    iconLbl.TextSize = 16
+    iconLbl.TextColor3 = Color3.new(1, 1, 1)
+    iconLbl.ZIndex = 9
+    iconLbl.Parent = iconBg
+
+    local textHolder = Instance.new("Frame")
+    textHolder.BackgroundTransparency = 1
+    textHolder.Position = UDim2.fromOffset(56, 0)
+    textHolder.Size = UDim2.new(1, -56 - 76, 1, 0)
+    textHolder.ZIndex = 8
+    textHolder.Parent = row
+
+    local titleLbl = Instance.new("TextLabel")
+    titleLbl.Text = opts.title
+    titleLbl.BackgroundTransparency = 1
+    titleLbl.Position = opts.subtitle and UDim2.fromOffset(0, 10) or UDim2.fromOffset(0, 0)
+    titleLbl.Size = UDim2.new(1, 0, 0, opts.subtitle and 18 or rowHeight)
+    titleLbl.Font = Enum.Font.Gotham
+    titleLbl.TextSize = 14
+    titleLbl.TextColor3 = Color3.fromRGB(0, 0, 0)
+    titleLbl.TextXAlignment = Enum.TextXAlignment.Left
+    titleLbl.TextYAlignment = opts.subtitle and Enum.TextYAlignment.Top or Enum.TextYAlignment.Center
+    titleLbl.ZIndex = 8
+    titleLbl.Parent = textHolder
+
+    if opts.subtitle then
+        local subtitleLbl = Instance.new("TextLabel")
+        subtitleLbl.Text = opts.subtitle
+        subtitleLbl.BackgroundTransparency = 1
+        subtitleLbl.Position = UDim2.fromOffset(0, 28)
+        subtitleLbl.Size = UDim2.new(1, 0, 0, 16)
+        subtitleLbl.Font = Enum.Font.Gotham
+        subtitleLbl.TextSize = 11
+        subtitleLbl.TextColor3 = Color3.fromRGB(140, 140, 145)
+        subtitleLbl.TextXAlignment = Enum.TextXAlignment.Left
+        subtitleLbl.ZIndex = 8
+        subtitleLbl.Parent = textHolder
+    end
+
+    local switch = Instance.new("Frame")
+    switch.AnchorPoint = Vector2.new(1, 0.5)
+    switch.Position = UDim2.new(1, -14, 0.5, 0)
+    switch.Size = UDim2.fromOffset(50, 30)
+    switch.BackgroundColor3 = opts.getter() and Color3.fromRGB(52, 199, 89) or Color3.fromRGB(229, 229, 234)
+    switch.BorderSizePixel = 0
+    switch.ZIndex = 8
+    switch.Parent = row
+    local sc = Instance.new("UICorner")
+    sc.CornerRadius = UDim.new(1, 0)
+    sc.Parent = switch
+
+    local knob = Instance.new("Frame")
+    knob.Size = UDim2.fromOffset(26, 26)
+    knob.Position = opts.getter() and UDim2.new(1, -28, 0.5, -13) or UDim2.new(0, 2, 0.5, -13)
+    knob.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+    knob.BorderSizePixel = 0
+    knob.ZIndex = 9
+    knob.Parent = switch
+    local kc = Instance.new("UICorner")
+    kc.CornerRadius = UDim.new(1, 0)
+    kc.Parent = knob
+
+    local clickBtn = Instance.new("TextButton")
+    clickBtn.BackgroundTransparency = 1
+    clickBtn.Size = UDim2.fromScale(1, 1)
+    clickBtn.Text = ""
+    clickBtn.ZIndex = 10
+    clickBtn.Parent = row
+
+    clickBtn.MouseButton1Click:Connect(function()
+        local newValue = not opts.getter()
+        opts.setter(newValue)
+        switch.BackgroundColor3 = newValue and Color3.fromRGB(52, 199, 89) or Color3.fromRGB(229, 229, 234)
+        knob:TweenPosition(
+            newValue and UDim2.new(1, -28, 0.5, -13) or UDim2.new(0, 2, 0.5, -13),
+            "Quad", 0.2
+        )
+    end)
+
+    local divider = Instance.new("Frame")
+    divider.BackgroundColor3 = Color3.fromRGB(230, 230, 235)
+    divider.BorderSizePixel = 0
+    divider.AnchorPoint = Vector2.new(0, 1)
+    divider.Position = UDim2.new(0, 56, 1, 0)
+    divider.Size = UDim2.new(1, -56, 0, 0.5)
+    divider.ZIndex = 7
+    divider.Parent = row
+
+    return row
+end
+
+local function addSliderRow(parent, opts)
+    local row = Instance.new("Frame")
+    row.BackgroundTransparency = 1
+    row.Size = UDim2.new(1, 0, 0, 68)
+    row.ZIndex = 7
+    row.Parent = parent
+
+    local iconBg = Instance.new("Frame")
+    iconBg.AnchorPoint = Vector2.new(0, 0)
+    iconBg.Position = UDim2.new(0, 14, 0, 14)
+    iconBg.Size = UDim2.fromOffset(30, 30)
+    iconBg.BackgroundColor3 = opts.iconColor
+    iconBg.BorderSizePixel = 0
+    iconBg.ZIndex = 8
+    iconBg.Parent = row
+    local ic = Instance.new("UICorner")
+    ic.CornerRadius = UDim.new(0, 7)
+    ic.Parent = iconBg
+
+    local iconLbl = Instance.new("TextLabel")
+    iconLbl.Text = opts.icon
+    iconLbl.BackgroundTransparency = 1
+    iconLbl.Size = UDim2.fromScale(1, 1)
+    iconLbl.Font = Enum.Font.GothamBold
+    iconLbl.TextSize = 16
+    iconLbl.TextColor3 = Color3.new(1, 1, 1)
+    iconLbl.ZIndex = 9
+    iconLbl.Parent = iconBg
+
+    local titleLbl = Instance.new("TextLabel")
+    titleLbl.Text = opts.title
+    titleLbl.BackgroundTransparency = 1
+    titleLbl.Position = UDim2.fromOffset(56, 12)
+    titleLbl.Size = UDim2.new(1, -70, 0, 20)
+    titleLbl.Font = Enum.Font.Gotham
+    titleLbl.TextSize = 14
+    titleLbl.TextColor3 = Color3.fromRGB(0, 0, 0)
+    titleLbl.TextXAlignment = Enum.TextXAlignment.Left
+    titleLbl.ZIndex = 8
+    titleLbl.Parent = row
+
+    local valueLbl = Instance.new("TextLabel")
+    valueLbl.Text = string.format("%.2f", opts.getter())
+    valueLbl.BackgroundTransparency = 1
+    valueLbl.AnchorPoint = Vector2.new(1, 0)
+    valueLbl.Position = UDim2.new(1, -16, 0, 12)
+    valueLbl.Size = UDim2.fromOffset(70, 20)
+    valueLbl.Font = Enum.Font.Gotham
+    valueLbl.TextSize = 14
+    valueLbl.TextColor3 = Color3.fromRGB(140, 140, 145)
+    valueLbl.TextXAlignment = Enum.TextXAlignment.Right
+    valueLbl.ZIndex = 8
+    valueLbl.Parent = row
+
+    local track = Instance.new("Frame")
+    track.Position = UDim2.fromOffset(56, 44)
+    track.Size = UDim2.new(1, -72, 0, 4)
+    track.BackgroundColor3 = Color3.fromRGB(229, 229, 234)
+    track.BorderSizePixel = 0
+    track.ZIndex = 8
+    track.Parent = row
+    local tc = Instance.new("UICorner")
+    tc.CornerRadius = UDim.new(1, 0)
+    tc.Parent = track
+
+    local fill = Instance.new("Frame")
+    fill.Size = UDim2.new((opts.getter() - opts.min) / (opts.max - opts.min), 0, 1, 0)
+    fill.BackgroundColor3 = Color3.fromRGB(0, 122, 255)
+    fill.BorderSizePixel = 0
+    fill.ZIndex = 9
+    fill.Parent = track
+    local fc = Instance.new("UICorner")
+    fc.CornerRadius = UDim.new(1, 0)
+    fc.Parent = fill
+
+    local dragging = false
+    local function updateFromX(x)
+        local rel = math.clamp((x - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1)
+        local value = opts.min + (opts.max - opts.min) * rel
+        fill.Size = UDim2.new(rel, 0, 1, 0)
+        valueLbl.Text = string.format("%.2f", value)
+        opts.setter(value)
+    end
+
+    track.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging = true
+            updateFromX(input.Position.X)
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(input)
+        if dragging and input.UserInputType == Enum.UserInputType.MouseMovement then
+            updateFromX(input.Position.X)
+        end
+    end)
+    UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging = false
+        end
+    end)
+
+    return row
+end
+
+--==========================================================================
+--  에임 페이지
+--==========================================================================
+createPageHeader(aimPage, "에임", function()
+    aimPage.Visible = false
+    aimPage.Position = UDim2.fromScale(1, 0)
+    appsHome.Visible = true
+end)
+
+local aimScroll = createPageBody(aimPage, 96)
+
+local aimCard1 = createCard(aimScroll, 1)
+addSettingRow(aimCard1, {
+    icon = "🎯", iconColor = Color3.fromRGB(255, 149, 0),
+    title = "에임봇",
+    subtitle = "FOV 안의 적 머리로 카메라 조준 (E 홀드)",
+    getter = function() return Config.AimbotEnabled end,
+    setter = function(v) Config.AimbotEnabled = v end,
+})
+addSettingRow(aimCard1, {
+    icon = "🎯", iconColor = Color3.fromRGB(52, 199, 89),
+    title = "팀원 무시",
+    getter = function() return Config.AimbotTeamCheck end,
+    setter = function(v) Config.AimbotTeamCheck = v end,
+})
+
+local aimCard2 = createCard(aimScroll, 2)
+addSettingRow(aimCard2, {
+    icon = "⚡", iconColor = Color3.fromRGB(0, 122, 255),
+    title = "트리거봇 (자동 발사)",
+    subtitle = "조준 중이면 자동으로 발사",
+    getter = function() return Config.TriggerbotEnabled end,
+    setter = function(v) Config.TriggerbotEnabled = v end,
+})
+addSettingRow(aimCard2, {
+    icon = "✨", iconColor = Color3.fromRGB(88, 86, 214),
+    title = "T 키 홀드",
+    getter = function() return Config.TriggerbotHold end,
+    setter = function(v) Config.TriggerbotHold = v end,
+})
+
+local aimCard3 = createCard(aimScroll, 3)
+addSettingRow(aimCard3, {
+    icon = "🔒", iconColor = Color3.fromRGB(0, 122, 255),
+    title = "에임 락",
+    subtitle = "적 머리에 카메라 고정 (자동 대상 선택)",
+    getter = function() return Config.AimLockEnabled end,
+    setter = function(v)
+        Config.AimLockEnabled = v
+        if not v then Config.AimLockTarget = nil end
+    end,
+})
+
+local aimCard4 = createCard(aimScroll, 4)
+addSliderRow(aimCard4, {
+    icon = "⭕", iconColor = Color3.fromRGB(255, 59, 48),
+    title = "FOV 반경",
+    min = 20, max = 500,
+    getter = function() return Config.AimbotFOV end,
+    setter = function(v)
+        Config.AimbotFOV = v
+        fovCircle.Size = UDim2.fromOffset(v * 2, v * 2)
+    end,
+})
+addSliderRow(aimCard4, {
+    icon = "⭕", iconColor = Color3.fromRGB(255, 149, 0),
+    title = "부드러움",
+    min = 0, max = 0.95,
+    getter = function() return Config.AimbotSmoothing end,
+    setter = function(v) Config.AimbotSmoothing = v end,
+})
+addSliderRow(aimCard4, {
+    icon = "⭕", iconColor = Color3.fromRGB(142, 142, 147),
+    title = "락 부드러움",
+    min = 0, max = 0.5,
+    getter = function() return Config.AimLockSmoothing end,
+    setter = function(v) Config.AimLockSmoothing = v end,
+})
+addSliderRow(aimCard4, {
+    icon = "⭕", iconColor = Color3.fromRGB(88, 86, 214),
+    title = "트리거봇 발사 지연",
+    min = 0, max = 0.5,
+    getter = function() return Config.TriggerbotDelay end,
+    setter = function(v) Config.TriggerbotDelay = v end,
+})
+addSliderRow(aimCard4, {
+    icon = "⭕", iconColor = Color3.fromRGB(52, 199, 89),
+    title = "트리거봇 판정 반경",
+    min = 1, max = 50,
+    getter = function() return Config.TriggerbotFOV end,
+    setter = function(v) Config.TriggerbotFOV = v end,
+})
+
+--==========================================================================
+--  ESP 페이지
+--==========================================================================
+createPageHeader(espPage, "ESP", function()
+    espPage.Visible = false
+    espPage.Position = UDim2.fromScale(1, 0)
+    appsHome.Visible = true
+end)
+
+local espScroll = createPageBody(espPage, 96)
+
+local espCard1 = createCard(espScroll, 1)
+addSettingRow(espCard1, {
+    icon = "👁", iconColor = Color3.fromRGB(52, 199, 89),
+    title = "ESP 활성화",
+    subtitle = "적/아군을 화면에 표시",
+    getter = function() return Config.ESPEnabled end,
+    setter = function(v) Config.ESPEnabled = v end,
+})
+addSettingRow(espCard1, {
+    icon = "🔴", iconColor = Color3.fromRGB(255, 59, 48),
+    title = "적 표시",
+    getter = function() return Config.ESPEnemies end,
+    setter = function(v) Config.ESPEnemies = v end,
+})
+addSettingRow(espCard1, {
+    icon = "🔵", iconColor = Color3.fromRGB(0, 122, 255),
+    title = "아군 표시",
+    getter = function() return Config.ESPTeammates end,
+    setter = function(v) Config.ESPTeammates = v end,
+})
+
+local espCard2 = createCard(espScroll, 2)
+addSettingRow(espCard2, {
+    icon = "▢", iconColor = Color3.fromRGB(255, 149, 0),
+    title = "박스",
+    getter = function() return Config.ESPBox end,
+    setter = function(v) Config.ESPBox = v end,
+})
+addSettingRow(espCard2, {
+    icon = "A", iconColor = Color3.fromRGB(88, 86, 214),
+    title = "이름",
+    getter = function() return Config.ESPName end,
+    setter = function(v) Config.ESPName = v end,
+})
+addSettingRow(espCard2, {
+    icon = "♥", iconColor = Color3.fromRGB(255, 45, 85),
+    title = "체력 바",
+    getter = function() return Config.ESPHealth end,
+    setter = function(v) Config.ESPHealth = v end,
+})
+addSettingRow(espCard2, {
+    icon = "📏", iconColor = Color3.fromRGB(142, 142, 147),
+    title = "거리",
+    getter = function() return Config.ESPDistance end,
+    setter = function(v) Config.ESPDistance = v end,
+})
+
+--==========================================================================
+--  페이지 전환
+--==========================================================================
+local function slideIn(page)
+    page.Visible = true
+    page.Position = UDim2.fromScale(1, 0)
+    TweenService:Create(page,
+        TweenInfo.new(0.3, Enum.EasingStyle.Quart, Enum.EasingDirection.Out),
+        { Position = UDim2.fromScale(0, 0) }):Play()
+end
+
+local function slideOut(page)
+    local tween = TweenService:Create(page,
+        TweenInfo.new(0.25, Enum.EasingStyle.Quart, Enum.EasingDirection.In),
+        { Position = UDim2.fromScale(1, 0) })
+    tween.Completed:Connect(function() page.Visible = false end)
+    tween:Play()
+end
+
+local function openAim()
+    if espPage.Visible then slideOut(espPage) end
+    appsHome.Visible = false
+    slideIn(aimPage)
+end
+
+local function openEsp()
+    if aimPage.Visible then slideOut(aimPage) end
+    appsHome.Visible = false
+    slideIn(espPage)
+end
+
+--==========================================================================
+--  홈 앱 아이콘
+--==========================================================================
+local function createAppButton(name, emoji, color, layoutOrder, onClick)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.fromOffset(200, 150)
+    btn.BackgroundTransparency = 1
+    btn.Text = ""
+    btn.AutoButtonColor = false
+    btn.LayoutOrder = layoutOrder
+    btn.ZIndex = 2
+    btn.Parent = appsGrid
+
+    local icon = Instance.new("Frame")
+    icon.AnchorPoint = Vector2.new(0.5, 0)
+    icon.Position = UDim2.new(0.5, 0, 0, 0)
+    icon.Size = UDim2.fromOffset(110, 110)
+    icon.BackgroundColor3 = color
+    icon.BorderSizePixel = 0
+    icon.ZIndex = 3
+    icon.Parent = btn
+    local ic = Instance.new("UICorner")
+    ic.CornerRadius = UDim.new(0, 26)
+    ic.Parent = icon
+
+    local iconGradient = Instance.new("UIGradient")
+    iconGradient.Rotation = 135
+    iconGradient.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, color:Lerp(Color3.new(1, 1, 1), 0.12)),
+        ColorSequenceKeypoint.new(1, color:Lerp(Color3.new(0, 0, 0), 0.18)),
+    })
+    iconGradient.Parent = icon
+
+    local iconLabel = Instance.new("TextLabel")
+    iconLabel.Text = emoji
+    iconLabel.BackgroundTransparency = 1
+    iconLabel.Size = UDim2.fromScale(1, 1)
+    iconLabel.Font = Enum.Font.GothamBold
+    iconLabel.TextSize = 50
+    iconLabel.TextColor3 = Color3.new(1, 1, 1)
+    iconLabel.ZIndex = 4
+    iconLabel.Parent = icon
+
+    local nameLabel = Instance.new("TextLabel")
+    nameLabel.Text = name
+    nameLabel.BackgroundTransparency = 1
+    nameLabel.Position = UDim2.fromOffset(0, 118)
+    nameLabel.Size = UDim2.new(1, 0, 0, 22)
+    nameLabel.Font = Enum.Font.Gotham
+    nameLabel.TextSize = 14
+    nameLabel.TextColor3 = Color3.fromRGB(0, 0, 0)
+    nameLabel.ZIndex = 3
+    nameLabel.Parent = btn
+
+    btn.MouseButton1Click:Connect(onClick)
+    return btn
+end
+
+createAppButton("에임", "🎯", Color3.fromRGB(255, 90, 90), 1, openAim)
+createAppButton("ESP",  "👁", Color3.fromRGB(80, 150, 255), 2, openEsp)
+
+--==========================================================================
+--  ★ Nova 로고 (동그란, 우주/폭발 테마)
+--==========================================================================
+local LOGO_SIZE = 70
+
+local logoBtn = Instance.new("TextButton")
+logoBtn.Name = "NovaLogo"
+logoBtn.AnchorPoint = Vector2.new(0.5, 0.5)
+logoBtn.Position = UDim2.new(0.75, 0, 0.5, 0)  --  초기 위치: 화면 오른쪽
+logoBtn.Size = UDim2.fromOffset(LOGO_SIZE, LOGO_SIZE)
+logoBtn.BackgroundColor3 = Color3.fromRGB(15, 10, 30)  --  깊은 우주 검정+보라
+logoBtn.BorderSizePixel = 0
+logoBtn.Text = ""
+logoBtn.AutoButtonColor = false
+logoBtn.Visible = false  --  처음엔 숨김
+logoBtn.ZIndex = 100
+logoBtn.Parent = phoneGui
+
+local logoCorner = Instance.new("UICorner")
+logoCorner.CornerRadius = UDim.new(1, 0)
+logoCorner.Parent = logoBtn
+
+--  테두리 (은은한 보라 네온)
+local logoStroke = Instance.new("UIStroke")
+logoStroke.Color = Color3.fromRGB(160, 100, 255)
+logoStroke.Thickness = 2
+logoStroke.Transparency = 0.3
+logoStroke.Parent = logoBtn
+
+--  배경 그라디언트 (우주 nebula 느낌)
+local logoGradient = Instance.new("UIGradient")
+logoGradient.Rotation = 45
+logoGradient.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0, Color3.fromRGB(60, 20, 120)),
+    ColorSequenceKeypoint.new(0.5, Color3.fromRGB(20, 10, 50)),
+    ColorSequenceKeypoint.new(1, Color3.fromRGB(0, 0, 10)),
+})
+logoGradient.Parent = logoBtn
+
+--  폭발 후광 (Glow)
+local logoGlow = Instance.new("ImageLabel")
+logoGlow.Name = "Glow"
+logoGlow.AnchorPoint = Vector2.new(0.5, 0.5)
+logoGlow.Position = UDim2.fromScale(0.5, 0.5)
+logoGlow.Size = UDim2.fromScale(1.6, 1.6)
+logoGlow.BackgroundTransparency = 1
+logoGlow.Image = "rbxassetid://5028857084"
+logoGlow.ImageColor3 = Color3.fromRGB(160, 100, 255)
+logoGlow.ImageTransparency = 0.55
+logoGlow.ZIndex = 99
+logoGlow.Parent = logoBtn
+
+--  별/파티클 (우주 느낌)
+for i = 1, 6 do
+    local star = Instance.new("Frame")
+    star.AnchorPoint = Vector2.new(0.5, 0.5)
+    star.Size = UDim2.fromOffset(2, 2)
+    star.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+    star.BorderSizePixel = 0
+    star.ZIndex = 101
+    star.Parent = logoBtn
+    local starCorner = Instance.new("UICorner")
+    starCorner.CornerRadius = UDim.new(1, 0)
+    starCorner.Parent = star
+    local angle = (i / 6) * math.pi * 2
+    local radius = LOGO_SIZE * 0.3
+    star.Position = UDim2.new(0.5, math.cos(angle) * radius, 0.5, math.sin(angle) * radius)
+    --  별 반짝임
+    task.spawn(function()
+        while star.Parent do
+            star.BackgroundTransparency = 0.3 + math.random() * 0.5
+            task.wait(0.3 + math.random() * 0.5)
+        end
+    end)
+end
+
+--  "NA" 텍스트 (기울기 -12도, 네온 시안/보라)
+local logoText = Instance.new("TextLabel")
+logoText.Name = "NAText"
+logoText.Text = "NA"
+logoText.BackgroundTransparency = 1
+logoText.Size = UDim2.fromScale(1, 1)
+logoText.Font = Enum.Font.GothamBold
+logoText.TextSize = 26
+logoText.TextColor3 = Color3.fromRGB(220, 200, 255)
+logoText.Rotation = -12
+logoText.ZIndex = 102
+logoText.Parent = logoBtn
+
+local textStroke = Instance.new("UIStroke")
+textStroke.Color = Color3.fromRGB(140, 80, 255)
+textStroke.Thickness = 1.5
+textStroke.Transparency = 0.2
+textStroke.Parent = logoText
+
+--  로고 클릭 → UI 복원
+logoBtn.MouseButton1Click:Connect(function()
+    --  UI 다시 표시
+    wrapper.Visible = true
+    wrapper.Size = UDim2.fromOffset(calculatePhoneSize())
+    wrapper.BackgroundTransparency = 1
+    --  스케일 애니메이션
+    local scale = Instance.new("UIScale")
+    scale.Scale = 0.7
+    scale.Parent = wrapper
+    TweenService:Create(scale, TweenInfo.new(0.25, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
+        { Scale = 1 }):Play()
+    task.delay(0.3, function() if scale.Parent then scale:Destroy() end end)
+    logoBtn.Visible = false
+end)
+
+--==========================================================================
+--  ★ RightShift 토글 (UI ↔ 로고)
+--==========================================================================
+local isMinimized = false
+
+local function minimizeUI()
+    if isMinimized then return end
+    isMinimized = true
+
+    --  로고를 UI와 같은 위치로 이동
+    logoBtn.Position = wrapper.Position
+
+    --  축소 애니메이션
+    local scale = Instance.new("UIScale")
+    scale.Scale = 1
+    scale.Parent = wrapper
+    local tween = TweenService:Create(scale, TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.In),
+        { Scale = 0.3 })
+    tween:Play()
+    tween.Completed:Connect(function()
+        wrapper.Visible = false
+        wrapper.BackgroundTransparency = 1
+        if scale.Parent then scale:Destroy() end
+        logoBtn.Visible = true
+
+        --  로고 등장 애니메이션
+        logoBtn.Size = UDim2.fromOffset(10, 10)
+        TweenService:Create(logoBtn, TweenInfo.new(0.25, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
+            { Size = UDim2.fromOffset(LOGO_SIZE, LOGO_SIZE) }):Play()
+    end)
+end
+
+local function restoreUI()
+    if not isMinimized then return end
+    isMinimized = false
+
+    logoBtn.Visible = false
+
+    --  로고 위치에 UI를 배치
+    wrapper.Position = logoBtn.Position
+    wrapper.Size = UDim2.fromOffset(calculatePhoneSize())
+    wrapper.Visible = true
+
+    local scale = Instance.new("UIScale")
+    scale.Scale = 0.3
+    scale.Parent = wrapper
+    local tween = TweenService:Create(scale, TweenInfo.new(0.25, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
+        { Scale = 1 })
+    tween:Play()
+    tween.Completed:Connect(function()
+        if scale.Parent then scale:Destroy() end
+    end)
+end
+
+UserInputService.InputBegan:Connect(function(input, gpe)
+    if gpe then return end
+    if input.KeyCode == Enum.KeyCode.RightShift then
+        if isMinimized then
+            restoreUI()
+        else
+            minimizeUI()
+        end
+    end
+    if input.KeyCode == Enum.KeyCode.K then
+        getgenv().SimpleAimESP_Unload()
+    end
+end)
+
+--==========================================================================
+--  ★ 드래그 (완전히 새로 구현 - UserInputService 기반)
+--==========================================================================
+local dragActive = false
+local dragOrigin = nil
+local dragStartPos = nil
+
+local function beginDrag(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        dragActive = true
+        dragOrigin = input.Position
+        dragStartPos = wrapper.Position
+    end
+end
+
+local function endDrag(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        dragActive = false
+        dragOrigin = nil
+        dragStartPos = nil
+    end
+end
+
+--  드래그 시작 대상들
+dragBar.InputBegan:Connect(beginDrag)
+notch.InputBegan:Connect(beginDrag)
+dragHint.InputBegan:Connect(beginDrag)
+
+--  드래그 중 (UserInputService의 InputChanged에서 감지)
+UserInputService.InputChanged:Connect(function(input)
+    if not dragActive then return end
+    if input.UserInputType ~= Enum.UserInputType.MouseMovement then return end
+    if not dragOrigin or not dragStartPos then return end
+
+    local delta = input.Position - dragOrigin
+    wrapper.Position = UDim2.new(
+        dragStartPos.X.Scale,
+        dragStartPos.X.Offset + delta.X,
+        dragStartPos.Y.Scale,
+        dragStartPos.Y.Offset + delta.Y
+    )
+    --  로고도 같이 이동
+    if logoBtn.Visible then
+        logoBtn.Position = wrapper.Position
+    end
+end)
+
+--  드래그 종료 (어디서 놓아도)
+UserInputService.InputEnded:Connect(endDrag)
+
+--==========================================================================
+--  언로드
+--==========================================================================
+getgenv().SimpleAimESP_Unload = function()
+    pcall(function() RunService:UnbindFromRenderStep(CAMERA_BIND_NAME) end)
+    if Camera.CameraType == Enum.CameraType.Scriptable then
+        Camera.CameraType = Enum.CameraType.Custom
+    end
+    for _, data in pairs(espObjects) do
+        for _, obj in pairs(data) do
+            if obj and obj.Destroy then obj:Destroy() end
+        end
+    end
+    espGui:Destroy()
+    fovGui:Destroy()
+    phoneGui:Destroy()
+    getgenv().SimpleAimESP_Unload = nil
+end
+
+print("[Nova] 로드 완료. RightShift: UI/로고 전환 | 상단바 드래그: 이동 | K: 언로드")
